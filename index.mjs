@@ -35,15 +35,31 @@ const MAX_MESSAGE_BYTES = MAX_MESSAGE_KB * 1024
 // 客户端 main 进程会给所有 *.wps.cn 请求的 Cookie 追加 x-kso-* 设备头
 // （x-kso-app-name=win-lingxi-desktop 等）。服务端判断"是不是桌面客户端"很可能看它，
 // 我们照拼（不带需要 plussvr RSA 的 signature，先验证是否必需）。
-const DEVICE_ID = createHash("sha256").update("magpie-lingxi-device").digest("hex")
-const KSO_COOKIE_PARTS = [
-  "x-kso-app-name=win-lingxi-desktop",
-  "x-kso-app-version=1.3.31",
-  `x-kso-device-id=${DEVICE_ID}`,
-]
+// 设备号必须**按账号**派生，不能全进程共用一个常量。
+// 上游实测不拿 wps_sid 绑设备号（换 device-id 反复请求都 200），但客户端自己的会话
+// 策略里 x-kso-device-id 是「一台设备」的身份：两个 WPS 账号共用同一个 device-id 时，
+// 客户端的单会话策略会把后登录的那次当成「同一台设备换了账号」，前一个账号的登录态
+// 随之作废 —— 这正是「登第二个把第一个顶掉」在上游侧的可能来源。
+// 按账号派生之后，每个账号各占一台「设备」，互不影响；同一账号重复登录仍得到同一个值。
+const DEVICE_SEED = "magpie-lingxi-device"
+function deviceIdOf(cookie) {
+  const text = String(cookie || "")
+  const uid = extractUid(text)
+  const sid = extractSid(text)
+  const who = uid ? `uid:${uid}` : sid ? `sid:${sid.slice(-8)}` : "shared"
+  return createHash("sha256").update(`${DEVICE_SEED}|${who}`).digest("hex")
+}
+function ksoCookieParts(cookie) {
+  return [
+    "x-kso-app-name=win-lingxi-desktop",
+    "x-kso-app-version=1.3.31",
+    `x-kso-device-id=${deviceIdOf(cookie)}`,
+  ]
+}
 function clientCookie(cookie) {
   if (process.env.MAGPIE_LINGXI_NO_KSO === "1") return cookie || ""
-  return cookie ? `${cookie}; ${KSO_COOKIE_PARTS.join("; ")}` : KSO_COOKIE_PARTS.join("; ")
+  const parts = ksoCookieParts(cookie)
+  return cookie ? `${cookie}; ${parts.join("; ")}` : parts.join("; ")
 }
 // 15 天内到期 = 临时积分（与 jet 插件同一判据）；可用 MAGPIE_LINGXI_TEMP_DAYS 调整。
 const TEMP_CREDIT_WINDOW_MS =
@@ -977,7 +993,8 @@ async function createCoworkSession(base, cookie, signal, extra = {}) {
     agent_version: 2,
     ...extra,
     env: {
-      device_id: DEVICE_ID,
+      // 与 Cookie 里的 x-kso-device-id 同源：一个 WPS 账号一台「设备」。
+      device_id: deviceIdOf(cookie),
       device_name: userInfo().username || "magpie",
       work_space_dir: tmpdir(),
     },
@@ -2163,6 +2180,22 @@ async function importLocalAccount(explicitDir) {
   return { error: `灵犀客户端里的 ${candidates.length} 个 wps_sid 全部失效（${detail}）。在客户端重新登录一次即可` }
 }
 
+// 老记录的顶层 uid 补齐。0.3.6 及以前只写 metadata.uid；magpie 的 settle 判据
+// （host.js: uidOf(a) = typeof a.uid === "string" ? a.uid : ""）只认记录顶层，
+// 缺了它以后「同 accountId 的下一次登录」会被判成同一个账号，整条旧记录被删掉替换
+// —— 表现就是「登第二个把第一个顶掉」。refresh 只在 expires 临近时才跑（本插件
+// expires 一年后），所以借每次 hook 顺手补一次；记录已经是新的就什么都不写。
+async function upgradeLegacyUid(client, auth) {
+  if (!client?.auth?.set || !auth) return
+  const cookie = resolveCookie(auth)
+  if (!cookie) return
+  const uid = auth?.metadata?.uid || extractUid(cookie)
+  if (!uid || auth?.uid === uid) return
+  try {
+    await client.auth.set({ id: PROVIDER, body: { ...auth, uid } })
+  } catch {}
+}
+
 export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
   const { client } = input
 
@@ -2202,6 +2235,9 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
       // 模型目录只取 /api/aioffice/v1/sessions/plans 的 data.models。
       async models(provider, { auth } = {}) {
         const cookie = resolveCookie(auth)
+        // 列表比 usage/checkin 触发得更早也更勤：老记录（只有 metadata.uid）
+        // 在用户下次登录之前就该补上顶层 uid，否则那次登录会把它顶掉。
+        void upgradeLegacyUid(client, auth)
         if (cookie) {
           const live = await fetchModelPlans(cookie, resolveBase(auth))
           if (live.length) {
@@ -2223,6 +2259,8 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
         const auth = await getAuth()
         const cookie = resolveCookie(auth)
         if (!cookie) return { outcome: "failed", message: "未配置 WPS Cookie，无法签到", signIn: "expired" }
+        // 顺手把 0.3.6 及以前的老记录补上顶层 uid（settle 只认它，见 upgradeLegacyUid）。
+        void upgradeLegacyUid(client, auth)
 
         try {
           const base = resolveBase(auth)
@@ -2296,6 +2334,10 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
         if (accountId) metadata.accountId = accountId
         const out = { metadata }
         if (accountId && auth.accountId !== accountId) out.accountId = accountId
+        // 顶层 uid 也要跟着补：magpie 的 settle 只认记录顶层的 uid 区分同名账号，
+        // 老记录（0.3.6 及以前）只有 metadata.uid，不补的话它永远是「可被同 accountId
+        // 的新登录顶掉」的状态。这里一次补齐。
+        if (uid && auth.uid !== uid) out.uid = uid
         return out
       },
 
@@ -2306,6 +2348,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
         if (!cookie) {
           return { error: "未检测到有效 WPS 登录凭证", signIn: "expired" }
         }
+        void upgradeLegacyUid(client, auth)
 
         try {
           const base = resolveBase(auth)
@@ -2469,6 +2512,10 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                     expires: Date.now() + 360 * 24 * 3600 * 1000,
                     cookie: cred.cookie,
                     accountId: cred.accountId,
+                    // magpie 的 settle 只认记录**顶层**的 uid 来区分同名账号
+                    // （host.js uidOf(a) 读 a.uid，不读 metadata.uid）。少了它，
+                    // accountId 相同的第二次登录会把已有账号整条删掉并顶替。
+                    ...(cred.uid ? { uid: cred.uid } : {}),
                     metadata: { sid: cred.sid, uid: cred.uid, cookieTail: cred.tail, accountId: cred.accountId, host },
                   })
                 } catch (error) {
@@ -2507,6 +2554,8 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 expires: Date.now() + 360 * 24 * 3600 * 1000,
                 cookie: cred.cookie,
                 accountId: cred.accountId,
+                // 顶层 uid：magpie 的 settle 靠它把同名不同账号分开（见浏览器登录那段）。
+                ...(cred.uid ? { uid: cred.uid } : {}),
                 metadata: {
                   sid: cred.sid,
                   uid: cred.uid,
@@ -2570,6 +2619,8 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                   expires: Date.now() + 360 * 24 * 3600 * 1000,
                   cookie: cred.cookie,
                   accountId: cred.accountId,
+                  // 顶层 uid：magpie 的 settle 靠它把同名不同账号分开（见浏览器登录那段）。
+                  ...(cred.uid ? { uid: cred.uid } : {}),
                   metadata: {
                     sid: cred.sid,
                     uid: cred.uid,
@@ -2627,4 +2678,6 @@ export const _internal = {
   browserLogin,
   safariLogin,
   chromiumLogin,
+  clientCookie,
+  deviceIdOf,
 }

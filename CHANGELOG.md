@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.7 — 2026-11-19
+
+- 修复「登录第二个账号会把第一个顶掉」：magpie 的账号表（`host.js` 的 `settle()`）判断两次登录
+  是不是同一个账号时，先看记录**顶层**的 `uid`（`uidOf(a) = typeof a.uid === "string" ? a.uid : ""`），
+  再看 `accountId`。插件以前只把 uid 放在 `metadata.uid`，顶层永久缺失，于是「`accountId` 相同的
+  下一次登录」被无条件判成同一账号，旧记录整条 `delete`。现在三处登录方式（浏览器登录、导入本机
+  客户端、粘贴 Cookie）的返回体都在顶层带 `uid`，`refresh()` 也会补上。
+- 老记录自动升格：0.3.6 及以前建的账号只有 `metadata.uid`，光改登录路径救不了它们。`models` /
+  `usage` / `checkin` 三个 hook 现在会顺手调一次 `client.auth.set` 把顶层 `uid` 补上（记录已经是
+  新的就什么都不写）。不能只靠 `refresh`：它只在 `expires` 进入 5 分钟窗口时跑，而本插件的
+  `expires` 在一年后。
+- 设备号改成**按账号派生**：以前全进程共用一个 `DEVICE_ID = sha256("magpie-lingxi-device")`，
+  两个 WPS 账号在 `x-kso-device-id` 上看起来是同一台设备，客户端的单会话策略会把后登录那次当成
+  「同一台设备换了账号」，前一个账号的登录态随之作废。现在 `deviceIdOf(cookie)` 按 `uid`（没有
+  uid 时按 sid 尾号）派生，每个账号各占一台「设备」；同一账号重复登录仍得到同一个值。
+  `cowork/sessions` 的 `env.device_id` 与 Cookie 头用同一个值，不再各说各话。
+  （实测上游并不拿 `wps_sid` 绑设备号，换 device-id 反复请求都 200；这条改的是客户端侧的会话语义。）
+
 ## 0.3.6 — 2026-11-19
 
 - 修复连续对话被上游 `409 ResourceConflict（资源已存在）` 打断：`run` 是一次性消费凭证，一次
