@@ -3,7 +3,7 @@
 // 同时提供每日签到、智点额度与客户端模型目录；不再使用网页端通路。
 
 import { createServer } from "node:http"
-import { createDecipheriv, createHash } from "node:crypto"
+import { createDecipheriv, createHash, randomUUID } from "node:crypto"
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { homedir, tmpdir, userInfo } from "node:os"
@@ -840,19 +840,34 @@ function inferSchemaType(node) {
   return "string"
 }
 
+// 上游只认 [A-Za-z0-9_-] 的工具名：带 `.` 或空格会整轮 200 + code=AIError
+// 「AI服务异常」，而且不告诉你是哪个工具、哪个字段。缺 parameters 也是同一下场。
+// MCP 工具天生带点（mcp__docs.report_view），所以这里改名，并把「上游名 → 原名」
+// 交给 translator，免得客户端按改过的名字认不出工具。
+const TOOL_NAME_SHAPE = /^[A-Za-z0-9_-]{1,64}$/
+const TOOL_NAME_MAP = Symbol("lingxiToolNameMap")
+
+function cleanToolName(name) {
+  const cleaned = String(name).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64)
+  return cleaned || "tool"
+}
+
 function filterTools(value) {
   const items = Array.isArray(value) ? value : []
   const kept = []
+  const nameMap = new Map()
   let dropped = 0
   for (const item of items) {
     const name = item?.function?.name
     if (item?.type !== "function" || typeof name !== "string" || !name.trim()) { dropped += 1; continue }
-    const parameters = item.function.parameters
-    kept.push(parameters && typeof parameters === "object"
-      ? { ...item, function: { ...item.function, parameters: sanitizeSchema(parameters) } }
-      : item)
+    const wireName = TOOL_NAME_SHAPE.test(name) ? name : cleanToolName(name)
+    if (wireName !== name) nameMap.set(wireName, name)
+    const parameters = item.function.parameters && typeof item.function.parameters === "object"
+      ? sanitizeSchema(item.function.parameters)
+      : { type: "object", properties: {} }
+    kept.push({ ...item, function: { ...item.function, name: wireName, parameters } })
   }
-  return { tools: kept, dropped }
+  return { tools: kept, dropped, nameMap }
 }
 
 function lastUserText(body) {
@@ -873,16 +888,29 @@ function lastUserText(body) {
 }
 
 // ── agent-runtime 直连平面（会话 + run + chat/completions）──────────────
-// 计费按 run：一个 run 内多次调用只扣一次智点，所以按「账号 × 模型」
-// 缓存 session/run，TTL 一小时；上游报 SQLNoRows / 会话不存在时重建一次。
+// 上游实测（2026-11）：**run 是一次性消费凭证**。同一个 X-Cc-Run-ID 打第二次
+// chat/completions —— 无论 payload 是否相同、隔多久 —— 都回
+//   409 {"code":"ResourceConflict","message":"资源已存在"}
+// 所以「一 run 多次调用只扣一次智点」这个假设是错的：一个 run 只能换一次回答，
+// 每轮对话都必须现领一个 run。这里缓存的是 **session**（可长期复用），
+// run 一律现领现用；只有 session 真过期（SQLNoRows / 会话不存在）才重建。
+// 另外 client_request_id 也不能只用 Date.now()：同一毫秒内两次领 run 会被
+// 上游幂等判成「资源已存在」，必须带随机后缀。
 
-const runs = new Map()
+const sessions = new Map()
 
 // PermissionDenied invalidates the session/run pair, even though the error is not retryable.
 function invalidateRun(run) {
-  for (const [key, cached] of runs) {
-    if (cached === run) runs.delete(key)
+  for (const [key, cached] of sessions) {
+    if (cached.sessionId && cached.sessionId === run?.sessionId) sessions.delete(key)
   }
+}
+
+// run 已被消费 / 已被占用：重新领一个就能继续，属于可恢复错误。
+function looksLikeConsumedRun(error) {
+  const code = String(error?.upstreamCode || "").toLowerCase()
+  return Number(error?.status) === 409 || code === "resourceconflict" ||
+    /资源已存在/.test(String(error?.message ?? ""))
 }
 
 function looksLikeStaleRun(message) {
@@ -961,7 +989,9 @@ async function createCoworkSession(base, cookie, signal, extra = {}) {
 
 async function createCreditsRun(base, cookie, sessionId, model, title, signal, { currentMode, clientType } = {}) {
   const payload = await postJson(`${base}${AGENT_RUNS_PATH}`, cookie, base, {
-    client_request_id: String(Date.now()),
+    // 上游按 client_request_id 做幂等：同一毫秒内两次领 run 会被判「资源已存在」。
+    // Date.now() 颗粒度不够，必须带随机后缀。
+    client_request_id: `${Date.now()}-${randomUUID().slice(0, 8)}`,
     session_id: sessionId,
     model_provider: "lingxi",
     model_id: model,
@@ -983,8 +1013,16 @@ async function createCreditsRun(base, cookie, sessionId, model, title, signal, {
 }
 
 async function ensureRun(cookie, key, model, title, signal, extra = {}, runExtra = {}) {
-  const hit = runs.get(key)
-  if (hit && Date.now() - hit.at < RUN_TTL_MS) return hit
+  const hit = sessions.get(key)
+  if (hit && Date.now() - hit.at < RUN_TTL_MS) {
+    try {
+      const { runId, groupId } = await createCreditsRun(hit.base, cookie, hit.sessionId, model, title, signal, runExtra)
+      return { ...hit, runId, groupId }
+    } catch (error) {
+      if (isAuditError(error) || !looksLikeStaleRun(error.message)) throw error
+      sessions.delete(key)
+    }
+  }
   let lastError
   // 先试 wps.cn（reference 实测的平面），404/401 再回落登录用的 kdocs 域名。
   for (const base of [BASE, KDOCS_BASE]) {
@@ -992,7 +1030,7 @@ async function ensureRun(cookie, key, model, title, signal, extra = {}, runExtra
       const sessionId = await createCoworkSession(base, cookie, signal, extra)
       const { runId, groupId } = await createCreditsRun(base, cookie, sessionId, model, title, signal, runExtra)
       const run = { base, sessionId, runId, groupId, at: Date.now() }
-      runs.set(key, run)
+      sessions.set(key, run)
       return run
     } catch (error) {
       if (isAuditError(error)) throw error
@@ -1097,7 +1135,7 @@ function fitAgentBody(body) {
 }
 
 function buildAgentBody(body, model) {
-  const { tools } = filterTools(body.tools)
+  const { tools, nameMap } = filterTools(body.tools)
   const out = { stream: true, model, messages: Array.isArray(body.messages) ? body.messages : [] }
   if (tools.length) {
     out.tools = tools
@@ -1116,6 +1154,8 @@ function buildAgentBody(body, model) {
       `[magpie-wps-lingxi] 提示词超过 ${MAX_PROMPT_KB}KB，已省略 ${fitted.dropped} 条历史、截断 ${fitted.elided} 条长消息`
     )
   }
+  // 反向映射挂在 payload 上，非枚举 → JSON.stringify 不会把它发给上游。
+  if (nameMap.size) Object.defineProperty(out, TOOL_NAME_MAP, { value: nameMap, enumerable: false })
   return out
 }
 
@@ -1144,8 +1184,9 @@ function normalizeUsage(usage) {
 }
 
 class LingxiTranslator {
-  constructor(model) {
+  constructor(model, nameMap) {
     this.model = model
+    this.nameMap = nameMap instanceof Map ? nameMap : null
     this.created = Math.floor(Date.now() / 1000)
     this.id = `chatcmpl-lingxi-${this.created}`
     this.buffer = ""
@@ -1236,7 +1277,9 @@ class LingxiTranslator {
             const item = { index: Number.isInteger(call?.index) ? call.index : index }
             if (typeof call?.id === "string" && call.id) { item.id = call.id; item.type = "function" }
             const fn = {}
-            if (typeof call?.function?.name === "string" && call.function.name) fn.name = call.function.name
+            if (typeof call?.function?.name === "string" && call.function.name) {
+              fn.name = this.nameMap?.get(call.function.name) || call.function.name
+            }
             if (typeof call?.function?.arguments === "string" && call.function.arguments) fn.arguments = call.function.arguments
             item.function = fn
             return item
@@ -1333,8 +1376,11 @@ async function requestAgent(cookie, run, payload, signal, clientType) {
 // 审核拦截是请求级 400；明确的 PermissionDenied 保留 403。
 // 其余沿用既有的模型/参数错误 404、登录失效 401 映射。
 // 只有明确的鉴权失败才给 401（否则会把账号标成未登录、从路由里摘掉）。
+// 409 正常已在 agentChat 里重试消化掉；漏到这里说明连重领 run 都冲突，
+// 给 429 比 502 更能说清「上游的一次性凭证卡住了」，不是网关崩了。
 function chatErrorStatus(error) {
   if (isAuditError(error)) return 400
+  if (looksLikeConsumedRun(error)) return 429
   if (isPermissionDenied(error)) return 403
   const status = Number(error?.status) || 0
   const text = String(error?.message || "")
@@ -1364,13 +1410,21 @@ async function agentChat({ cookie, body, stream, requestedModel, signal, errorRe
   try {
     response = await requestAgent(cookie, run, payload, signal, clientType)
   } catch (error) {
-    if (isAuditError(error) || !looksLikeStaleRun(error.message)) throw error
-    runs.delete(key)
-    run = await ensureRun(cookie, key, requestedModel, lastUserText(body), signal, sessionExtra, runExtra)
+    if (isAuditError(error)) throw error
+    if (looksLikeConsumedRun(error)) {
+      // run 被别的请求消费掉 / 并发抢同一个 run：现领一个新的重试一次，session 不动。
+      const fresh = await createCreditsRun(run.base, cookie, run.sessionId, requestedModel, lastUserText(body), signal, runExtra)
+      run = { ...run, ...fresh }
+    } else if (looksLikeStaleRun(error.message)) {
+      sessions.delete(key)
+      run = await ensureRun(cookie, key, requestedModel, lastUserText(body), signal, sessionExtra, runExtra)
+    } else {
+      throw error
+    }
     response = await requestAgent(cookie, run, payload, signal, clientType)
   }
 
-  const translator = new LingxiTranslator(requestedModel)
+  const translator = new LingxiTranslator(requestedModel, payload[TOOL_NAME_MAP])
 
   if (!stream) {
     const frames = []
@@ -1645,15 +1699,22 @@ async function runTaskConversation(cookie, base, { clientType, sessionMode, curr
     }
     const signal = AbortSignal.timeout(120000)
     let run = await ensureRun(cookie, key, model, text || TASK_TEXT, signal, sessionExtra, runExtra)
+    const payload = buildAgentBody(body, model)
     await putExecutionStatus(cookie, base, run, "running")
     let response
     try {
-      response = await requestAgent(cookie, run, buildAgentBody(body, model), signal, clientType)
+      response = await requestAgent(cookie, run, payload, signal, clientType)
     } catch (error) {
-      if (!looksLikeStaleRun(error.message)) throw error
-      runs.delete(key)
-      run = await ensureRun(cookie, key, model, text || TASK_TEXT, signal, sessionExtra, runExtra)
-      response = await requestAgent(cookie, run, buildAgentBody(body, model), signal, clientType)
+      if (looksLikeConsumedRun(error)) {
+        const fresh = await createCreditsRun(run.base, cookie, run.sessionId, model, text || TASK_TEXT, signal, runExtra)
+        run = { ...run, ...fresh }
+      } else if (looksLikeStaleRun(error.message)) {
+        sessions.delete(key)
+        run = await ensureRun(cookie, key, model, text || TASK_TEXT, signal, sessionExtra, runExtra)
+      } else {
+        throw error
+      }
+      response = await requestAgent(cookie, run, payload, signal, clientType)
     }
     const text2 = await response.text().catch(() => "")
     await putExecutionStatus(cookie, base, run, "completed")
@@ -2046,11 +2107,12 @@ async function importLocalAccount(explicitDir) {
   }
 
   const dbs = clientCookieDbs(dataDir)
+  const candidates = []
 
   for (const file of dbs) {
     let rows
     try {
-      rows = await sqliteAll(file, "select host_key,name,value,encrypted_value from cookies where name in ('wps_sid','uid')")
+      rows = await sqliteAll(file, "select host_key,name,value,encrypted_value from cookies where name in ('wps_sid','uid','kso_sid')")
     } catch { continue }
     const found = {}
     for (const row of rows) {
@@ -2067,17 +2129,38 @@ async function importLocalAccount(explicitDir) {
     const sid = found.wps_sid || ""
     if (sid.length < 16) continue
     const uid = found.uid || ""
-    const cookie = `wps_sid=${sid}${uid ? `; uid=${uid}` : ""}`
-    return {
+    candidates.push({
       sid,
       uid,
-      cookie,
-      host: await probeBase(cookie),
-      accountId: uid ? `wps-${uid}` : `wps-${sid.slice(-8)}`,
-      tail: cookieTail(sid),
+      cookie: `wps_sid=${sid}${uid ? `; uid=${uid}` : ""}`,
+    })
+  }
+  if (!candidates.length) {
+    return { error: "客户端里没有已登录的 wps_sid —— 先在灵犀客户端登录一次，或改用浏览器登录" }
+  }
+  // 逐分区验活：客户端进程会占住 business/passport 的 Cookies 库（sqlite 打不开），
+  // 遍历就落到最早那个 in-app-browser-<旧uid> 分区 —— sid 格式合法、解密成功、
+  // 但上游 401。所以必须把所有候选都试一遍，取第一个真活的。
+  const verdicts = await Promise.all(candidates.map(async (item) => ({
+    item, ...(await verifyCookie(item.cookie)),
+  })))
+  const winner = verdicts.find((v) => v.ok)
+  if (winner) {
+    const { item } = winner
+    return {
+      sid: item.sid,
+      uid: item.uid,
+      cookie: item.cookie,
+      host: winner.host,
+      accountId: item.uid ? `wps-${item.uid}` : `wps-${item.sid.slice(-8)}`,
+      tail: cookieTail(item.sid),
     }
   }
-  return { error: "客户端里没有已登录的 wps_sid —— 先在灵犀客户端登录一次，或改用浏览器登录" }
+  // 全死：把每个分区各自的失败原因摊出来，比「重新粘贴 Cookie」这种话有用。
+  const detail = verdicts
+    .map((v) => `${v.item.uid ? `uid ${v.item.uid}` : `尾号 ${v.item.sid.slice(-6)}`} → ${(v.tried || []).join(" / ") || "验活失败"}`)
+    .join("；")
+  return { error: `灵犀客户端里的 ${candidates.length} 个 wps_sid 全部失效（${detail}）。在客户端重新登录一次即可` }
 }
 
 export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
