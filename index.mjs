@@ -44,9 +44,12 @@ const MAX_MESSAGE_BYTES = MAX_MESSAGE_KB * 1024
 const DEVICE_SEED = "magpie-lingxi-device"
 function deviceIdOf(cookie) {
   const text = String(cookie || "")
-  const uid = extractUid(text)
   const sid = extractSid(text)
-  const who = uid ? `uid:${uid}` : sid ? `sid:${sid.slice(-8)}` : "shared"
+  // wps_sid 尾部 10 位就是 `00` + hex(uid)，所以没有 uid 键也能拿到真实账号号；
+  // 用它派生设备号，同一账号在不同分区（有/无 uid 键）仍然算同一台设备。
+  const uid = extractUid(text) || uidFromSid(sid)
+  const kso = extractKsoSid(text)
+  const who = uid ? `uid:${uid}` : sid ? `sid:${sid.slice(-8)}` : kso ? `kso:${kso.slice(-8)}` : "shared"
   return createHash("sha256").update(`${DEVICE_SEED}|${who}`).digest("hex")
 }
 function ksoCookieParts(cookie) {
@@ -212,8 +215,12 @@ function getTodayString() {
 
 // 登录凭据解析：用户粘贴的可能是裸 wps_sid、`wps_sid=…`、整段
 // `Cookie: wps_sid=…; uid=…`，或 DevTools 里复制的一整行。统一归一成
-// `wps_sid=…; uid=…`，并按 uid（没有就按 sid 尾部）区分账号 —— 固定
+// `wps_sid=…; uid=…; kso_sid=…`，并按 uid（没有就按 sid 尾部）区分账号 —— 固定
 // accountId 会让第二个账号覆盖第一个。
+//
+// kso_sid 是同一账号的第二把凭据（275 字，站点级、长效）。实测：只带 kso_sid 也能
+// 跑完整 cowork → credits/runs → chat 链路；wps_sid 被上游作废时，活着的 kso_sid
+// 仍能兜住。所以两把都要留着 —— 旧版只认 wps_sid，把 kso_sid 当垃圾丢了。
 function parseCookieInput(raw) {
   let text = String(raw ?? "").trim()
   if (!text) return null
@@ -229,16 +236,32 @@ function parseCookieInput(raw) {
   }
 
   let sid = pairs.get("wps_sid") || ""
-  // 裸值（没有 `=`）就是 wps_sid 本身
-  if (!sid && !text.includes("=")) sid = text
-  if (!sid) return null
+  let ksoSid = pairs.get("kso_sid") || pairs.get("ksoSid") || pairs.get("kso") || ""
+  // 裸值（没有 `=`）：长且带点的是 kso_sid（base64url 的 2 段），否则当 wps_sid。
+  if (!sid && !ksoSid && !text.includes("=")) {
+    if (text.length >= 100 && text.includes(".")) ksoSid = text
+    else sid = text
+  }
+  // 两把都必须像会话令牌；只有一个也照样收（上游任一单独可用）。
+  if (sid && sid.length < 16) sid = ""
+  if (ksoSid && ksoSid.length < 16) ksoSid = ""
+  if (!sid && !ksoSid) return null
 
   const uid = pairs.get("uid") || ""
   // 灰度 region：客户端从 cookie copilot_server_branch 读，随请求发 X-Cc-Region。
   const region = pairs.get("copilot_server_branch") || ""
-  const cookie = `wps_sid=${sid}${uid ? `; uid=${uid}` : ""}${region ? `; copilot_server_branch=${region}` : ""}`
-  const accountId = uid ? `wps-${uid}` : `wps-${sid.slice(-8)}`
-  return { sid, uid, region, cookie, accountId }
+  const cookie = [
+    sid ? `wps_sid=${sid}` : "",
+    uid ? `uid=${uid}` : "",
+    ksoSid ? `kso_sid=${ksoSid}` : "",
+    region ? `copilot_server_branch=${region}` : "",
+  ].filter(Boolean).join("; ")
+  // 账号号优先 uid 键，其次从 wps_sid 尾部解出来（`00`+hex(uid)），最后才退到随机尾号。
+  const accountUid = uid || uidFromSid(sid)
+  const accountId = accountUid
+    ? `wps-${accountUid}`
+    : sid ? `wps-${sid.slice(-8)}` : `wps-kso-${ksoSid.slice(-8)}`
+  return { sid, ksoSid, uid, region, cookie, accountId }
 }
 
 
@@ -257,7 +280,30 @@ function extractSid(value) {
     return ""
   }
   // 裸值：长度像会话 Cookie 才收（太短的多半是误粘的别的令牌）
-  return text.length >= 16 ? text : ""
+  return text.length >= 16 && !(text.length >= 100 && text.includes(".")) ? text : ""
+}
+
+function extractKsoSid(value) {
+  const text = String(value ?? "").trim()
+  if (!text) return ""
+  if (text.includes("=") || text.includes(";")) {
+    for (const part of text.split(";")) {
+      const item = part.trim()
+      const lower = item.toLowerCase()
+      if (!lower.startsWith("kso_sid=") && !lower.startsWith("ksosid=")) continue
+      const kso = item.slice(item.indexOf("=") + 1).trim().replace(/^"|"$/g, "")
+      if (kso) return kso
+    }
+    return ""
+  }
+  return text.length >= 100 && text.includes(".") ? text : ""
+}
+
+// wps_sid 尾部 10 位是 `00` + hex(uid)：离线就能认出这把 sid 属于哪个账号，
+// 不需要 profile 请求（客户端分区的目录名和它一一对得上）。
+function uidFromSid(sid) {
+  const m = String(sid || "").slice(-10).match(/^00([0-9a-f]{8})$/i)
+  return m ? String(parseInt(m[1], 16)) : ""
 }
 
 function extractUid(value) {
@@ -275,28 +321,37 @@ function identityOf(text) {
 
 const cookieTail = (sid) => String(sid).slice(-4)
 
-// 账号的会话凭据统一从 parseCookieInput 归一：保留 wps_sid 与 uid（多账号靠 uid 区分），
-// 其余键（kso_sid / rtk / lang…）不需要，也不该发给上游。
+// 账号的会话凭据统一从 parseCookieInput 归一：保留 wps_sid、uid 与 kso_sid，
+// 其余键（rtk / itk / lang…）不需要，也不该发给上游。
 function resolveCookie(auth) {
   if (!auth) return ""
-  const cred = parseCookieInput(
-    auth.metadata?.cookie || auth.cookie || auth.key || auth.access || auth.metadata?.sid || ""
-  )
+  const meta = auth.metadata || {}
+  const raw = [meta.cookie, auth.cookie, auth.key, auth.access, meta.sid]
+    .filter((item) => typeof item === "string" && item.trim())
+    .join("; ")
+  const cred = parseCookieInput(raw)
+  // metadata 上单独存的 ksoSid 也要救回来（老记录 cookie 里可能只有死掉的 wps_sid）。
+  const metaKso = typeof meta.ksoSid === "string" ? meta.ksoSid.trim() : ""
+  if (metaKso && cred && !cred.ksoSid) {
+    return parseCookieInput(`${cred.cookie}; kso_sid=${metaKso}`)?.cookie || cred.cookie
+  }
+  if (metaKso && !cred) return parseCookieInput(`kso_sid=${metaKso}`)?.cookie || ""
   return cred ? cred.cookie : ""
 }
 
 function normalizeCredential(raw) {
   const cred = parseCookieInput(raw)
-  if (!cred) return { error: "没有在输入里找到 wps_sid（可粘贴整段 Cookie 或 wps_sid 的值）" }
-  if (cred.sid.length < 16) return { error: "wps_sid 太短，像是不完整的粘贴" }
+  if (!cred) return { error: "没有在输入里找到 wps_sid 或 kso_sid（可粘贴整段 Cookie 或其中一个的值）" }
+  if (!cred.sid && !cred.ksoSid) return { error: "wps_sid 与 kso_sid 都太短，像是不完整的粘贴" }
   return {
     sid: cred.sid,
+    ksoSid: cred.ksoSid,
     uid: cred.uid,
     region: cred.region || "",
-    identity: identityOf(cred.sid),
+    identity: identityOf(cred.sid || cred.ksoSid),
     cookie: cred.cookie,
     accountId: cred.accountId,
-    tail: cookieTail(cred.sid),
+    tail: cookieTail(cred.sid || cred.ksoSid),
   }
 }
 
@@ -592,9 +647,9 @@ async function chromiumLogin({ browser, url, timeoutMs = 5 * 60 * 1000, signal }
       let cookies = []
       try { cookies = await cookiesOf(port) } catch {}
       const sid = cookies.find((cookie) => cookie?.name === "wps_sid" && String(cookie.value || "").trim())
-      if (sid) {
-        const uid = cookies.find((cookie) => cookie?.name === "uid")?.value || ""
-        return { sid: String(sid.value).trim(), uid: String(uid || "").trim() }
+      if (sid || cookies.some((cookie) => cookie?.name === "kso_sid" && String(cookie.value || "").trim())) {
+        const pick = (name) => String(cookies.find((cookie) => cookie?.name === name)?.value || "").trim()
+        return { sid: sid ? String(sid.value).trim() : "", uid: pick("uid"), ksoSid: pick("kso_sid") }
       }
       await sleep(1500)
     }
@@ -701,9 +756,9 @@ async function safariLogin({ url, timeoutMs = 5 * 60 * 1000, signal }) {
       signal?.throwIfAborted()
       const cookies = await sessionCookies(base, sessionId).catch(() => [])
       const sid = cookies.find((cookie) => cookie?.name === "wps_sid" && String(cookie.value || "").trim())
-      if (sid) {
-        const uid = cookies.find((cookie) => cookie?.name === "uid")?.value || ""
-        return { sid: String(sid.value).trim(), uid: String(uid || "").trim() }
+      if (sid || cookies.some((cookie) => cookie?.name === "kso_sid" && String(cookie.value || "").trim())) {
+        const pick = (name) => String(cookies.find((cookie) => cookie?.name === name)?.value || "").trim()
+        return { sid: sid ? String(sid.value).trim() : "", uid: pick("uid"), ksoSid: pick("kso_sid") }
       }
       await sleep(1500)
     }
@@ -2144,16 +2199,25 @@ async function importLocalAccount(explicitDir) {
       if (!found[name] || host.endsWith("wps.cn")) found[name] = value
     }
     const sid = found.wps_sid || ""
-    if (sid.length < 16) continue
+    const ksoSid = found.kso_sid || ""
+    // 两把凭据任一足够；只有 kso_sid 的分区也能用（上游实测只带 kso_sid 全链路可通）。
+    if (!sid && !ksoSid) continue
+    if (sid && sid.length < 16) continue
+    if (ksoSid && ksoSid.length < 16) continue
     const uid = found.uid || ""
     candidates.push({
       sid,
+      ksoSid,
       uid,
-      cookie: `wps_sid=${sid}${uid ? `; uid=${uid}` : ""}`,
+      cookie: [
+        sid ? `wps_sid=${sid}` : "",
+        uid ? `uid=${uid}` : "",
+        ksoSid ? `kso_sid=${ksoSid}` : "",
+      ].filter(Boolean).join("; "),
     })
   }
   if (!candidates.length) {
-    return { error: "客户端里没有已登录的 wps_sid —— 先在灵犀客户端登录一次，或改用浏览器登录" }
+    return { error: "客户端里没有已登录的 wps_sid / kso_sid —— 先在灵犀客户端登录一次，或改用浏览器登录" }
   }
   // 逐分区验活：客户端进程会占住 business/passport 的 Cookies 库（sqlite 打不开），
   // 遍历就落到最早那个 in-app-browser-<旧uid> 分区 —— sid 格式合法、解密成功、
@@ -2164,20 +2228,24 @@ async function importLocalAccount(explicitDir) {
   const winner = verdicts.find((v) => v.ok)
   if (winner) {
     const { item } = winner
+    const accountUid = item.uid || uidFromSid(item.sid)
     return {
       sid: item.sid,
-      uid: item.uid,
+      ksoSid: item.ksoSid,
+      uid: item.uid || accountUid,
       cookie: item.cookie,
       host: winner.host,
-      accountId: item.uid ? `wps-${item.uid}` : `wps-${item.sid.slice(-8)}`,
-      tail: cookieTail(item.sid),
+      accountId: accountUid
+        ? `wps-${accountUid}`
+        : item.sid ? `wps-${item.sid.slice(-8)}` : `wps-kso-${item.ksoSid.slice(-8)}`,
+      tail: cookieTail(item.sid || item.ksoSid),
     }
   }
   // 全死：把每个分区各自的失败原因摊出来，比「重新粘贴 Cookie」这种话有用。
   const detail = verdicts
-    .map((v) => `${v.item.uid ? `uid ${v.item.uid}` : `尾号 ${v.item.sid.slice(-6)}`} → ${(v.tried || []).join(" / ") || "验活失败"}`)
+    .map((v) => `${v.item.uid ? `uid ${v.item.uid}` : `尾号 ${String(v.item.sid || v.item.ksoSid).slice(-6)}`} → ${(v.tried || []).join(" / ") || "验活失败"}`)
     .join("；")
-  return { error: `灵犀客户端里的 ${candidates.length} 个 wps_sid 全部失效（${detail}）。在客户端重新登录一次即可` }
+  return { error: `灵犀客户端里的 ${candidates.length} 个凭据全部失效（${detail}）。在客户端重新登录一次即可` }
 }
 
 // 老记录的顶层 uid 补齐。0.3.6 及以前只写 metadata.uid；magpie 的 settle 判据
@@ -2324,11 +2392,15 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
         if (!cookie) return {}
         const base = resolveBase(auth)
         const sid = extractSid(cookie)
+        const ksoSid = extractKsoSid(cookie)
         const profile = await fetchProfile(cookie, base).catch(() => ({}))
-        const uid = auth.metadata?.uid || extractUid(cookie) || profile.id || ""
-        const accountId = uid ? `wps-${uid}` : sid ? `wps-${sid.slice(-8)}` : undefined
+        const uid = auth.metadata?.uid || extractUid(cookie) || uidFromSid(sid) || profile.id || ""
+        const accountId = uid
+          ? `wps-${uid}`
+          : sid ? `wps-${sid.slice(-8)}` : ksoSid ? `wps-kso-${ksoSid.slice(-8)}` : undefined
         const metadata = { ...(auth.metadata || {}) }
         if (sid) metadata.sid = metadata.sid || sid
+        if (ksoSid) metadata.ksoSid = metadata.ksoSid || ksoSid
         if (uid) metadata.uid = uid
         if (profile.name) metadata.name = profile.name
         if (accountId) metadata.accountId = accountId
@@ -2495,18 +2567,21 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             const done = new Promise((resolve, reject) => {
               void (async () => {
                 try {
-                  const { sid, uid } = await chromiumLogin({
+                  const { sid, uid, ksoSid } = await chromiumLogin({
                     browser,
                     url: `${BASE}/`,
                     timeoutMs: 5 * 60 * 1000,
                     signal: controller.signal,
                   })
-                  const cred = normalizeCredential(`wps_sid=${sid}${uid ? `; uid=${uid}` : ""}`)
+                  const cred = normalizeCredential(
+                    [sid ? `wps_sid=${sid}` : "", uid ? `uid=${uid}` : "", ksoSid ? `kso_sid=${ksoSid}` : ""]
+                      .filter(Boolean).join("; ")
+                  )
                   if (cred.error) throw new Error(cred.error)
                   const host = await probeBase(cred.cookie)
                   resolve({
                     type: "success",
-                    access: cred.sid,
+                    access: cred.sid || cred.ksoSid,
                     refresh: "",
                     // Cookie 约一年有效；没有刷新接口，真正的判据是上游 401。
                     expires: Date.now() + 360 * 24 * 3600 * 1000,
@@ -2516,7 +2591,15 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                     // （host.js uidOf(a) 读 a.uid，不读 metadata.uid）。少了它，
                     // accountId 相同的第二次登录会把已有账号整条删掉并顶替。
                     ...(cred.uid ? { uid: cred.uid } : {}),
-                    metadata: { sid: cred.sid, uid: cred.uid, cookieTail: cred.tail, accountId: cred.accountId, host },
+                    metadata: {
+                      sid: cred.sid,
+                      ksoSid: cred.ksoSid,
+                      uid: cred.uid,
+                      cookieTail: cred.tail,
+                      cookie: cred.cookie,
+                      accountId: cred.accountId,
+                      host,
+                    },
                   })
                 } catch (error) {
                   reject(error)
@@ -2543,12 +2626,15 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             if (cred?.error) throw new Error(cred.error)
             return {
               url: `${BASE}/`,
-              instructions: "已读取本机灵犀客户端登录态，无需输入任何内容",
+              // 客户端是单登录态：它只记住「当前这一个」账号。要加第二个账号，得先在客户端里
+              // 切过去再点一次；切换时客户端会把上一个账号的 wps_sid 作废（本地实测），
+              // 所以这里把 kso_sid 一起带走 —— 那把凭据是账号级长效的，切换后仍然能用。
+              instructions: `已读取本机客户端登录态（账号 ${cred.accountId}${cred.ksoSid ? "，已带上 kso_sid 兜底" : "，没有 kso_sid 兜底"}），无需输入任何内容`,
               method: "auto",
               opened: true,
               callback: async () => ({
                 type: "success",
-                access: cred.sid,
+                access: cred.sid || cred.ksoSid,
                 refresh: "",
                 // Cookie 约一年有效；没有刷新接口，真正的判据是上游 401。
                 expires: Date.now() + 360 * 24 * 3600 * 1000,
@@ -2558,6 +2644,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 ...(cred.uid ? { uid: cred.uid } : {}),
                 metadata: {
                   sid: cred.sid,
+                  ksoSid: cred.ksoSid,
                   uid: cred.uid,
                   cookieTail: cred.tail,
                   cookie: cred.cookie,
@@ -2613,7 +2700,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                 }
                 return {
                   type: "success",
-                  access: cred.sid,
+                  access: cred.sid || cred.ksoSid,
                   refresh: "",
                   // Cookie 约一年有效；没有刷新接口，真正的判据是上游 401。
                   expires: Date.now() + 360 * 24 * 3600 * 1000,
@@ -2623,6 +2710,7 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
                   ...(cred.uid ? { uid: cred.uid } : {}),
                   metadata: {
                     sid: cred.sid,
+                    ksoSid: cred.ksoSid,
                     uid: cred.uid,
                     cookieTail: cred.tail,
                     cookie: cred.cookie,
@@ -2680,4 +2768,6 @@ export const _internal = {
   chromiumLogin,
   clientCookie,
   deviceIdOf,
+  extractKsoSid,
+  uidFromSid,
 }

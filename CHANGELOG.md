@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.8 — 2026-11-19
+
+- `kso_sid` 全链路支持。实测（活号 + 死号对照）：只带 `kso_sid=<275 字>` 也能跑完
+  `cowork/sessions` → `credits/runs` → `agent-runtime/chat/completions` 拿到正文；
+  一把**已被上游作废**的 `wps_sid` 配上活着的 `kso_sid` 也照样 200。以前插件把它当垃圾：
+  `parseCookieInput` 只认 `wps_sid`（裸 `kso_sid` 还会被误当成 `wps_sid`），`resolveCookie`
+  把 cookie 里的 `kso_sid` 直接丢掉，`importLocalAccount` 的 SQL 查了 `kso_sid` 却从不拼进
+  cookie。现在解析 / 归一 / 发上游 / 选号四处都保留它，登录记录在 `metadata.ksoSid` 里另存一份。
+- `accountId` 改用 `wps_sid` 尾部解码出来的 uid。`wps_sid` 末 10 位恒为 `"00" + hex(uid)`
+  （客户端 `Partitions\lingxi-in-app-browser-<uid>` 目录名与之一一对应，实测 5 个分区全中），
+  所以像 `in-app-browser-*` 这种**不带 `uid` 键**的分区也能得到 `wps-<uid>` 而不是
+  `wps-<sid 后 8 位>` —— 同一个账号从不同分区导入不再变成两个账号。
+- 设备号同步用这个解码 uid 派生，有 `uid` 键和没有 `uid` 键的同一把账号得到同一个
+  `x-kso-device-id`。
+- 「导入本机灵犀客户端账号」的提示语如实说明：客户端是单登录态，要加第二个账号得先在客户端
+  切过去再点一次；切换会作废上一个 `wps_sid`，但 `kso_sid` 会一起带走，所以仍然可用。
 ## 0.3.7 — 2026-11-19
 
 - 修复「登录第二个账号会把第一个顶掉」：magpie 的账号表（`host.js` 的 `settle()`）判断两次登录
